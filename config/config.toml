@@ -1,0 +1,218 @@
+# 运行参数
+[app]
+listen_timeout_s = 8.0   # LISTENING 状态静默超时
+llm_timeout_s = 5.0      # THINKING 等待首 token 超时
+sim_char_delay = 0.01    # 模拟模式逐字输出间隔（秒）
+
+# LLM 接入：默认云端优先，失败/超时自动降级到本地
+[llm]
+provider = "cloud"           # cloud=云端优先 | local=本地优先
+first_token_timeout_s = 8.0  # 首 token 超时即降级（云端大模型较慢，别设太小）
+
+[llm.cloud]
+base_url = "https://api.scnet.cn/api/llm/v1"  # 国家超算互联网（OpenAI 兼容）
+model = "GLM-5.3-Flash"                       # 可用 --model 参数临时切换
+api_key_env = "SCNET_API_KEY"                 # 从该环境变量读取密钥
+timeout_s = 60.0
+
+# 供应商专有参数（会并入请求体）。GLM-5.3 / GLM-5.3-Flash 的思考功能强制开启、
+# 无法关闭，只能靠 reasoning_effort 调档。默认 max 会让首字延迟变高且思考
+# token 计入输出费用，故设为 low；
+# response_format 强制 JSON 输出，避免模型多轮后"飘"成纯文本、丢掉情绪字段：
+[llm.cloud.extra]
+reasoning_effort = "low"
+response_format = { type = "json_object" }
+
+[llm.local]
+base_url = "http://localhost:11434"
+model = "qwen2.5:7b"
+timeout_s = 120.0
+
+# 长期记忆（技术方案 §5.5 / §7.3）
+[memory]
+enabled = true
+db_path = "data/memory.db"
+retrieval = "embedding"        # lexical=离线词面检索(零依赖) | embedding=向量检索(见下 provider)
+top_k = 3                      # 注入 Prompt 的记忆条数上限（§7.3 要求 K<=5）
+min_confidence = 0.6           # 低于此置信度的事实不注入 Prompt
+min_score = 0.15               # 词面模式阈值（查询侧覆盖率）
+extract_min_confidence = 0.6   # 抽取时丢弃低于此置信度的事实
+
+# 短期记忆：近 N 天对话摘要，SQLite 滚动（§5.5）。跨会话提供"最近聊过什么"的连续性。
+[memory.short_term]
+enabled = true
+db_path = "data/short_term.db"
+days = 7                       # 滚动窗口：超过 7 天的记录在写入时自动清理
+inject_limit = 5               # 每轮注入 Prompt 的最近摘要条数
+max_chars = 40                 # 单条用户话语/回应的截断长度，控制 Prompt 长度
+
+# 向量检索：retrieval="embedding" 时按 provider 选择编码器。
+# 两种模式分数量纲不同，阈值需分别设定。
+[memory.embedding]
+provider = "local"             # local=端侧ONNX(bge-small-zh，不消耗额度) | openai=云端兼容接口
+min_score = 0.46               # 向量模式阈值（余弦）：实测相关≥0.46、无关≤0.46；
+                               # bge-small-zh 对短句区分度有限，仅在边界重叠，可按需上调
+
+# 端侧编码器：int8 量化 bge-small-zh，模型文件缺失时自动退回词面检索。
+# 首次使用需下载模型：python -m robot.memory.onnx_embedder --fetch
+[memory.embedding.local]
+model_dir = "data/models/bge-small-zh-v1.5"
+max_length = 512
+
+# 云端编码器：需额度。注：实测 SCNet 的 embedding 接口返回 402（余额不足）。
+[memory.embedding.openai]
+base_url = "https://api.scnet.cn/api/llm/v1"
+model = "Qwen3-Embedding-8B"
+api_key_env = "SCNET_API_KEY"
+timeout_s = 20.0
+
+# 内容服务（M6，技术方案 §5.1 services/）：天气 + 日程，均为只读拉取。
+# 拉取失败或没有内容就整段省略、不开口（不哑原则），不会硬凑话。
+[services]
+enabled = true
+
+# 天气：Open-Meteo，免费且免 API Key；经纬度按你所在城市改
+[services.weather]
+provider = "open-meteo"
+latitude = 31.2304
+longitude = 121.4737
+city = "上海"                  # 仅用于播报措辞，如"上海今天多云"
+timezone = "Asia/Shanghai"
+timeout_s = 10.0
+rain_threshold = 60            # 降水概率达此值才提醒带伞，见 rain_alert 任务
+
+# 日程：iCalendar 订阅。ics_path 填本地 .ics，ics_url 填订阅链接（可只填其一，也可都填）
+[services.calendar]
+ics_path = ""
+ics_url = ""
+timezone = "Asia/Shanghai"
+days = 2                       # 播报"今天 + 未来几天"内的日程
+timeout_s = 10.0
+
+# 资讯：RSS / Atom 订阅聚合（免 Key）。单个源失败/非 RSS 内容只影响该源。
+# 注：36kr 已改成直接回 HTML、不再提供 RSS，故未收录。
+[services.news]
+feeds = [
+  "https://sspai.com/feed",       # 少数派
+  "https://www.ithome.com/rss/",  # IT之家
+]
+per_feed = 1                    # 每源取前几条标题
+max_items = 3                   # 合并去重后的播报条数上限
+timeout_s = 8.0
+
+# 主动服务调度（M6，技术方案 §5.7）
+# 打扰控制：安静时段内绝不主动开口；每日主动次数有上限；只在 IDLE（没在说话）时开口。
+# 注：原方案用 scheduler.yaml，本项目统一收在 config.toml，免去 YAML 依赖。
+[scheduler]
+enabled = true
+tick_interval_s = 20.0        # 轮询间隔（秒）；窗口/间隔触发器都靠它推进
+quiet_hours = "23:00-07:00"   # 全局安静时段，支持跨午夜
+max_daily = 5                 # 每日主动开口上限（§5.7）
+default_gap_minutes = 120     # 距上次互动不足该时长时不主动搭话（防"刚聊完又开口"）
+
+# at 支持 "HH:MM-HH:MM"（窗口内触发一次）或 "HH:MM"（到点后触发一次）
+[[scheduler.tasks]]
+id = "morning_greet"
+at = "08:00-09:30"
+min_gap_minutes = 120         # 早上没聊过才问候
+
+[[scheduler.tasks]]
+id = "water_reminder"
+at = "09:30-22:00"
+every_minutes = 90
+text = "记得喝口水，别一直盯着屏幕～"
+
+[[scheduler.tasks]]
+id = "late_night"
+at = "23:00"
+text = "挺晚了，早点收工休息吧。"
+
+# 传感器触发的示例（无硬件时用 /sched sense humidity 30 模拟上报，§4.4）
+[[scheduler.tasks]]
+id = "dry_air"
+sensor = "humidity"
+delta = 8                     # 湿度相对上次读数变化 ≥ 8% 才提醒
+text = "空气好像有点干，我给你倒杯水吧？"
+
+# 早间播报与带伞提醒：内容来自 services（天气 + 日程）。
+# 取不到内容（断网/无日程）就整个跳过，不会硬凑；因带信息量，不受"刚聊过"限制。
+[[scheduler.tasks]]
+id = "morning_brief"
+at = "07:30-09:00"
+source = "briefing"
+text = "早上好呀"
+min_gap_minutes = 0
+
+[[scheduler.tasks]]
+id = "rain_alert"
+at = "07:30-09:00"
+source = "rain_alert"
+min_gap_minutes = 0
+
+# 资讯速览：内容来自 services/news（RSS 聚合）
+[[scheduler.tasks]]
+id = "news_digest"
+at = "12:00-13:00"
+source = "news"
+min_gap_minutes = 0
+
+# 人格设定（角色卡）
+[persona]
+name = "小伴"
+role = "住在桌上的温暖伙伴"
+age_impression = "20 出头，活泼但懂分寸"
+traits = ["温柔", "幽默", "好奇", "不评判"]
+catchphrases = ["嗯嗯，我在听~", "这个我记下啦"]
+
+[persona.speaking_style]
+sentence_length = "短，1~2 句为主"
+emoji_policy = "不输出 emoji，用语气词"
+avoid = ["说教", "长篇大论", "机械客服腔"]
+
+[persona.voice]
+engine = "console"
+speed = 1.0
+
+# 开场白：开机时按当前时间段自动选择一句
+[persona.greetings]
+morning = "早呀，睡得好吗？今天有什么打算？"
+afternoon = "下午好呀，中间记得起来倒杯水~"
+evening = "晚上好，今天过得怎么样？"
+night = "这么晚还没睡呀，那我陪着你。"
+
+# 情绪 -> 表达策略（屏幕表情 + LED 灯效 + 舵机动作）
+# M5：三个通道默认用终端预览（console），接上圆屏/灯环/舵机后换成硬件驱动即可。
+# led 字段是"颜色_模式"拼接串，支持 solid / breath / pulse / wave 四种模式。
+[expression]
+screen = "console"        # console=终端文字表情 | none=关闭
+led = "console"           # console=终端灯效预览 | none=关闭
+servo = "console"         # console=终端动作轨迹预览 | none=关闭
+blink_interval_s = 4.0    # 屏幕眨眼的独立协程间隔（§5.8）；<=0 表示不眨眼
+
+[persona.expressions.neutral]
+led = "soft_purple_breath"
+gesture = "still"
+
+[persona.expressions.happy]
+led = "warm_orange"
+gesture = "nod"
+
+[persona.expressions.excited]
+led = "warm_orange_pulse"
+gesture = "bounce"
+
+[persona.expressions.sad]
+led = "dim_blue_breath"
+gesture = "tilt_down"
+
+[persona.expressions.anxious]
+led = "calm_cyan_breath"
+gesture = "still"
+
+[persona.expressions.angry]
+led = "steady_cyan"
+gesture = "still"
+
+[persona.expressions.tired]
+led = "soft_amber"
+gesture = "slow_nod"
