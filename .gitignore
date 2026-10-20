@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 工具缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 运行时数据：记忆库属本地隐私数据，不入库
+data/*.db
+
+# 端侧 embedding 模型（约 23MB，用 CLI 重新下载即可，不入库）
+data/models/
+
+# 本地密钥
+.env
+*.env
