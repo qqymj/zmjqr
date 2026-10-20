@@ -25,14 +25,14 @@ response_format = { type = "json_object" }
 
 [llm.local]
 base_url = "http://localhost:11434"
-model = "qwen2.5:7b"
+model = "qwen2.5:3b"
 timeout_s = 120.0
 
 # 长期记忆（技术方案 §5.5 / §7.3）
 [memory]
 enabled = true
 db_path = "data/memory.db"
-retrieval = "embedding"        # lexical=离线词面检索(零依赖) | embedding=向量检索(见下 provider)
+retrieval = "lexical"        # lexical=离线词面检索(零依赖) | embedding=向量检索(见下 provider)
 top_k = 3                      # 注入 Prompt 的记忆条数上限（§7.3 要求 K<=5）
 min_confidence = 0.6           # 低于此置信度的事实不注入 Prompt
 min_score = 0.15               # 词面模式阈值（查询侧覆盖率）
